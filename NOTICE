@@ -1,10 +1,16 @@
-RDMA Buffer 1.0.0
+RDMA Buffer
+
 Copyright 2026 Summon Software Labs
 
-This product includes software developed by Summon Software Labs.
+RDMA Buffer is an open-source, vendor-neutral runtime for governing the lifecycle and correctness of memory intended for RDMA-capable transfer.
 
-The Apache License, Version 2.0, governs use, reproduction, and
-distribution of this product. See the LICENSE file for the full text.
+This product is licensed under the Apache License, Version 2.0. See the
+LICENSE file in this distribution for the full license text.
 
-No telemetry is transmitted. All observations, logs, benchmarks, and
-persisted state remain local to the deployment.
+RDMA Buffer does not collect or transmit any telemetry. All telemetry is
+written to local files chosen by the operator and never leaves the machine
+running the software.
+
+RDMA Buffer accepts contributions from individuals and organizations on the
+terms of the Apache License 2.0 without requiring a Contributor License
+Agreement (CLA). See CONTRIBUTING.md for contribution guidance.
