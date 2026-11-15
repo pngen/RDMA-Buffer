@@ -255,6 +255,11 @@ int main(int argc, char** argv) {
         q.domain = dom; q.backend = syn->id(); q.node = NodeId(1); q.process = ProcessId(1);
         AccessDecision d = rt.validate_remote_access(q);
         PROOF(d.outcome != AccessOutcome::ALLOW, "old registration authority stale after restart (" + std::string(access_outcome_name(d.outcome)) + ")");
+        // The registration itself is stale, not only the old envelope: the
+        // current incarnation's own authority must not revive it either.
+        q.authority = envelope(rt.authority());
+        AccessDecision dc = rt.validate_remote_access(q);
+        PROOF(dc.outcome != AccessOutcome::ALLOW, "old registration rejected under the current incarnation's authority (" + std::string(access_outcome_name(dc.outcome)) + ")");
     }
 
     // Release worker A's stale registration so the buffer can be

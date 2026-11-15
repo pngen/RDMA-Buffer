@@ -106,6 +106,24 @@ TEST_CASE(synthetic_generation_rollover_invalidates_keys) {
     CHECK(o == AccessOutcome::REJECT_STALE_REGISTRATION || o == AccessOutcome::REJECT_STALE_KEY);
 }
 
+// ---- regression: a NIC generation change invalidates keys like a transport rollover ----
+TEST_CASE(synthetic_nic_generation_rollover_invalidates_keys) {
+    SyntheticBackend b(3);
+    RegistrationContext ctx;
+    ctx.worker_boot = WorkerBootId(1); ctx.epoch = CoordinatorEpoch(1);
+    ctx.registration_generation = RegistrationGeneration(1); ctx.backend_generation = BackendGeneration(1);
+    auto d = testutil::make_buffer(1, 1, MemoryDomain::SYNTHETIC_REMOTE_CAPABLE, 4096, 4096, AccessRight::REMOTE_WRITE);
+    BackendRegistration out;
+    CHECK(b.register_buffer(d, ctx, out).ok);
+    std::string ex;
+    CHECK(b.query_remote_access(RegisterHandle{out.memory_region_id, out.handle}, out.keys,
+                                OperationKind::WRITE, 0, 8, ex) == AccessOutcome::ALLOW);
+    b.rollover_nic_generation();
+    AccessOutcome o = b.query_remote_access(RegisterHandle{out.memory_region_id, out.handle}, out.keys,
+                                            OperationKind::WRITE, 0, 8, ex);
+    CHECK(o == AccessOutcome::REJECT_STALE_REGISTRATION || o == AccessOutcome::REJECT_STALE_KEY);
+}
+
 TEST_CASE(synthetic_permission_denied_when_right_not_granted) {
     SyntheticBackend b(2);
     RegistrationContext ctx;

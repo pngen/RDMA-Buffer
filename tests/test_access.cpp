@@ -129,4 +129,60 @@ TEST_CASE(unknown_atomic_capability_rejected) {
     CHECK(d.outcome != AccessOutcome::ALLOW);
 }
 
+// ---- regression: a registration is bound to the incarnation that issued it ----
+
+TEST_CASE(registration_from_superseded_incarnation_rejected) {
+    // Participant restart: the epoch and the boot id both move on. The fresh
+    // incarnation's own envelope must not revive the old registration.
+    {
+        RegFixture f; f.init();
+        f.rt.note_participant_restart();
+        const AuthorityEnvelope fresh = testutil::make_envelope(2, 2, 1, 1, 1);
+        auto q = f.request(OperationKind::WRITE, 0, 1024, AccessRight::REMOTE_WRITE);
+        q.authority = fresh;
+        CHECK(f.rt.validate_remote_access(q).outcome == AccessOutcome::REJECT_STALE_EPOCH);
+        CHECK(!f.rt.acquire_lease(f.reg, fresh, access_mask(AccessRight::REMOTE_WRITE)).ok);
+        CHECK(f.rt.accounting().active_leases.get() == 0);
+    }
+    // Epoch rollover alone.
+    {
+        RegFixture f; f.init();
+        f.rt.advance_epoch();
+        const AuthorityEnvelope fresh = testutil::make_envelope(2, 1, 1, 1, 1);
+        auto q = f.request(OperationKind::WRITE, 0, 1024, AccessRight::REMOTE_WRITE);
+        q.authority = fresh;
+        CHECK(f.rt.validate_remote_access(q).outcome == AccessOutcome::REJECT_STALE_EPOCH);
+        auto d = testutil::make_buffer(1, 1, MemoryDomain::SYNTHETIC_REMOTE_CAPABLE, 4096, 4096,
+                                        AccessRight::REMOTE_READ | AccessRight::REMOTE_WRITE);
+        RegisterResult ru = f.rt.register_buffer_reuse(d, f.backend->id(), f.domain, fresh);
+        CHECK(!ru.ok);
+        CHECK(ru.reuse == ReuseDecision::REUSE_MISS);
+    }
+    // A new WorkerBootId under the same epoch.
+    {
+        RegFixture f; f.init();
+        f.rt.set_authority(testutil::make_snapshot(1, 7));
+        const AuthorityEnvelope fresh = testutil::make_envelope(1, 7, 1, 1, 1);
+        auto q = f.request(OperationKind::WRITE, 0, 1024, AccessRight::REMOTE_WRITE);
+        q.authority = fresh;
+        CHECK(f.rt.validate_remote_access(q).outcome == AccessOutcome::REJECT_STALE_BOOT);
+        CHECK(!f.rt.acquire_lease(f.reg, fresh, access_mask(AccessRight::REMOTE_WRITE)).ok);
+    }
+}
+
+// ---- regression: stale-authority rejections are counted like every other rejection ----
+
+TEST_CASE(stale_authority_rejections_are_counted) {
+    RegFixture f; f.init();
+    auto q = f.request(OperationKind::WRITE, 0, 1024, AccessRight::REMOTE_WRITE);
+    q.authority = testutil::make_envelope(1, 555, 1, 1, 1); // stale boot
+    CHECK(f.rt.validate_remote_access(q).outcome == AccessOutcome::REJECT_STALE_BOOT);
+    CHECK(f.rt.accounting().failed_access_attempts.get() == 1);
+    CHECK(f.rt.accounting().stale_access_rejections.get() == 1);
+    q.authority = testutil::make_envelope(99, 1, 1, 1, 1);  // stale epoch
+    CHECK(f.rt.validate_remote_access(q).outcome == AccessOutcome::REJECT_STALE_EPOCH);
+    CHECK(f.rt.accounting().failed_access_attempts.get() == 2);
+    CHECK(f.rt.accounting().stale_access_rejections.get() == 2);
+}
+
 int main() { return testfw::run_all(); }

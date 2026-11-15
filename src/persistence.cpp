@@ -319,6 +319,8 @@ bool decode_authority(bytes::Reader& r, AuthoritySnapshot& s) {
         !r.u64(reinterpret_cast<std::uint64_t&>(s.node)) ||
         !r.u64(reinterpret_cast<std::uint64_t&>(s.process))) return false;
     std::uint8_t pv = 0; if (!r.u8(pv)) return false;
+    if (pv > static_cast<std::uint8_t>(Provenance::UNKNOWN)) return false;
+    s.provenance = static_cast<Provenance>(pv);
     return true;
 }
 

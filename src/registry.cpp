@@ -11,6 +11,7 @@
 #include <fstream>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rdmabuffer {
@@ -28,6 +29,11 @@ std::string int_to_str(std::uint64_t v) { return std::to_string(v); }
 class Rdmabuffer::Impl {
 public:
     mutable std::mutex mutex_;
+    // Serializes every call this runtime makes into a backend. Backend
+    // registration work runs outside mutex_, so without this two callers could
+    // be inside the same backend at once. Lock order: mutex_, then
+    // backend_mutex_.
+    mutable std::mutex backend_mutex_;
 
     AuthoritySnapshot authority_;
     std::unordered_map<BackendId, std::shared_ptr<IBackend>> backends_;
@@ -51,6 +57,8 @@ public:
     std::unordered_map<BufferId, RegistrationId> active_registration_for_buffer_;
     std::unordered_map<RegistrationLeaseId, Lease> leases_;
     Accounting acct_;
+    // Registrations currently counted in acct_, so each is released exactly once.
+    std::unordered_set<RegistrationId> accounted_;
 
     std::uint64_t next_buffer_{1};
     std::uint64_t next_registration_{1};
@@ -87,11 +95,13 @@ public:
         std::lock_guard<std::mutex> g(mutex_);
         auto it = backends_.find(id);
         if (it == backends_.end()) return {};
+        std::lock_guard<std::mutex> bg(backend_mutex_);
         return it->second->capabilities();
     }
 
     std::vector<BackendInfo> backend_summaries() {
         std::lock_guard<std::mutex> g(mutex_);
+        std::lock_guard<std::mutex> bg(backend_mutex_);
         std::vector<BackendInfo> out;
         for (auto& [id, b] : backends_) {
             BackendInfo info;
@@ -153,7 +163,13 @@ public:
     // -- buffers ---------------------------------------------------
     BufferId create_buffer(const BufferDescriptor& descriptor) {
         std::lock_guard<std::mutex> g(mutex_);
-        BufferId id = descriptor.id.is_valid() ? descriptor.id : BufferId(next_buffer_++);
+        if (!descriptor.generation.is_valid()) return {};      // unset generation.
+        BufferId id = descriptor.id;
+        if (!id.is_valid()) {
+            // An assigned id never aliases a buffer that already exists.
+            while (buffers_.count(BufferId(next_buffer_)) != 0) ++next_buffer_;
+            id = BufferId(next_buffer_++);
+        }
         auto it = buffers_.find(id);
         if (it != buffers_.end()) {
             const std::uint64_t cur = it->second.descriptor.generation.value();
@@ -172,6 +188,9 @@ public:
                     account_registration_invalidate(rec);
                 }
             }
+            // No registration of the replaced generation is active any more, so
+            // the new generation can be registered.
+            active_registration_for_buffer_.erase(id);
             // Adjust live bytes delta.
             if (descriptor.byte_length >= it->second.descriptor.byte_length) {
                 acct_.live_buffer_bytes.increment(descriptor.byte_length - it->second.descriptor.byte_length);
@@ -184,6 +203,7 @@ public:
         }
         BufferEntry be;
         be.descriptor = descriptor;
+        be.descriptor.id = id;
         be.registered = false;
         buffers_[id] = std::move(be);
         acct_.logical_buffers.increment();
@@ -212,6 +232,7 @@ public:
         RegisterResult rr;
         RegistrationRecord rec;
         RegistrationContext ctx;
+        std::shared_ptr<IBackend> b;
         {
             std::lock_guard<std::mutex> g(mutex_);
             AccessDecision ad = validate_authority(authority_, env);
@@ -222,7 +243,7 @@ public:
                 rr.miss_reason = ad.code;
                 return rr;
             }
-            auto b = backend_locked(backend);
+            b = backend_locked(backend);
             if (!b) {
                 rr.ok = false;
                 rr.explanation = "unknown backend";
@@ -263,6 +284,7 @@ public:
                 rr.miss_reason = "REGISTRATION_IN_FLIGHT";
                 return rr;
             }
+            std::lock_guard<std::mutex> bg(backend_mutex_);
             std::string can = b->can_register(descriptor);
             if (!can.empty()) {
                 rr.ok = false;
@@ -307,43 +329,84 @@ public:
             ctx.backend_generation = b->generation();
             ctx.requested_access = descriptor.requested_access;
             ctx.mode = descriptor.registration_mode;
+
+            // Reserve the registration and the buffer's single-flight slot
+            // before the lock is released, so a concurrent registration of the
+            // same buffer is refused while this one is in flight.
+            registrations_[rec.id] = rec;
+            active_registration_for_buffer_[rec.buffer_id] = rec.id;
         } // unlock
 
         // Backend registration work happens outside the global lock.
         BackendRegistration bout;
-        if (auto b = backend_locked(backend); b) {
-            RegisterOutcome bo = b->register_buffer(descriptor, ctx, bout);
-            if (!bo.ok) {
-                std::lock_guard<std::mutex> g(mutex_);
-                rr.ok = false;
-                rr.result = RegistrationResult::PARTIAL_FAILURE;
-                rr.explanation = "backend registration failed: " + bo.message;
-                rr.miss_reason = bo.code;
-                return rr;
-            }
-        } else {
-            std::lock_guard<std::mutex> g(mutex_);
-            rr.ok = false;
-            rr.explanation = "backend vanished during registration";
-            rr.miss_reason = "UNKNOWN_BACKEND";
-            return rr;
+        RegisterOutcome bo;
+        {
+            std::lock_guard<std::mutex> bg(backend_mutex_);
+            bo = b->register_buffer(descriptor, ctx, bout);
         }
         {
             std::lock_guard<std::mutex> g(mutex_);
+            // The lock was released for the backend call: commit only if the
+            // reservation and everything it was validated against still hold.
+            auto rit = registrations_.find(rec.id);
+            std::string superseded;
+            std::string superseded_why;
+            if (bo.ok) {
+                const AccessDecision ad = validate_authority(authority_, env);
+                const auto dit = domains_.find(domain);
+                const auto bit = buffers_.find(descriptor.id);
+                if (rit == registrations_.end() ||
+                    rit->second.lifecycle != RegistrationLifecycle::REGISTERING) {
+                    superseded = "REGISTRATION_SUPERSEDED";
+                    superseded_why = "registration was invalidated while the backend registered it";
+                } else if (ad.outcome != AccessOutcome::ALLOW) {
+                    superseded = ad.code;
+                    superseded_why = ad.explanation;
+                } else if (dit == domains_.end() || dit->second.state != DomainState::ACTIVE) {
+                    superseded = "DOMAIN_INVALID";
+                    superseded_why = "protection domain missing or not active";
+                } else if (bit == buffers_.end() ||
+                           bit->second.descriptor.generation != descriptor.generation) {
+                    superseded = "GENERATION_MISMATCH";
+                    superseded_why = "buffer generation mismatch";
+                }
+            }
+            if (!bo.ok || !superseded.empty()) {
+                // Roll back: release the backend registration (if one was
+                // made), the reserved record, and the single-flight slot.
+                if (bo.ok) {
+                    std::lock_guard<std::mutex> bg(backend_mutex_);
+                    std::string ignored;
+                    b->abort_registration(RegisterHandle{bout.memory_region_id, bout.handle}, ignored);
+                }
+                if (rit != registrations_.end()) registrations_.erase(rit);
+                auto ait = active_registration_for_buffer_.find(rec.buffer_id);
+                if (ait != active_registration_for_buffer_.end() && ait->second == rec.id) {
+                    active_registration_for_buffer_.erase(ait);
+                }
+                rr.ok = false;
+                rr.result = RegistrationResult::PARTIAL_FAILURE;
+                rr.explanation = bo.ok ? "registration rolled back: " + superseded_why
+                                       : "backend registration failed: " + bo.message;
+                rr.miss_reason = bo.ok ? superseded : bo.code;
+                return rr;
+            }
             rec.memory_region_id = bout.memory_region_id;
             rec.backend_handle = bout.handle;
             rec.start = bout.registered_base;
             rec.length = bout.registered_length;
             rec.granted_access = bout.granted_access;
+            rec.transport = bout.transport;
+            rec.nic = bout.nic;
             rec.local_key = LocalKey{bout.keys.local_key_id, rec.id, rec.registration_generation,
                                      authority_.worker_boot, backend, TransportClass::TCP_REFERENCE,
-                                     bout.granted_access, bout.keys.opaque_value, Provenance::SYNTHETIC};
+                                     bout.granted_access, bout.keys.opaque_value, bout.keys.provenance};
             rec.remote_key = RemoteKey{bout.keys.remote_key_id, rec.id, rec.registration_generation,
                                        bout.keys.remote_key_generation, rec.buffer_generation,
                                        authority_.worker_boot, authority_.process, backend,
                                        TransportClass::TCP_REFERENCE, bout.granted_access,
                                        rec.start, rec.length, bout.keys.opaque_value, false,
-                                       Provenance::SYNTHETIC};
+                                       bout.keys.provenance};
             rec.provenance = bout.provenance;
             rec.freshness = Freshness::VALID;
             rec.lifecycle = RegistrationLifecycle::ACTIVE;
@@ -425,6 +488,13 @@ public:
             cand.lifecycle != RegistrationLifecycle::REGISTERED)
             return "Candidate registration not active";
         if (cand.boot != env.worker_boot) return "WorkerBootId mismatch";
+        if (cand.epoch != authority_.coordinator_epoch) return "CoordinatorEpoch changed since registration";
+        {
+            std::lock_guard<std::mutex> bg(backend_mutex_);
+            auto bit = backends_.find(cand.backend);
+            if (bit == backends_.end() || bit->second->generation() != cand.backend_generation)
+                return "Backend generation changed since registration";
+        }
         if (cand.freshness != Freshness::VALID) return "Candidate freshness not valid";
         if (!cand.remote_key.revoked && !cand.remote_key.id.is_valid())
             return "Candidate remote key absent";
@@ -467,6 +537,11 @@ public:
             lr.explanation = "registration freshness is not VALID";
             return lr;
         }
+        if (rec.epoch != authority_.coordinator_epoch || rec.boot != authority_.worker_boot) {
+            lr.ok = false;
+            lr.explanation = "registration was issued under a superseded CoordinatorEpoch or WorkerBootId";
+            return lr;
+        }
         Lease ls;
         ls.id = RegistrationLeaseId(next_lease_++);
         ls.registration = registration;
@@ -493,10 +568,20 @@ public:
         auto it = leases_.find(lease);
         if (it == leases_.end()) return false;   // duplicate release or unknown.
         if (it->second.state == LeaseState::RELEASED) return false; // duplicate release.
+        // A lease that a hard revoke already revoked was closed out of the
+        // lease accounting then; releasing it must not decrement again.
+        const bool was_active = it->second.state == LeaseState::ACTIVE;
         it->second.state = LeaseState::RELEASED;
+        if (!was_active) return true;
         auto rit = registrations_.find(it->second.registration);
         if (rit != registrations_.end()) {
             if (rit->second.lease_count > 0) --rit->second.lease_count;
+            // A soft revoke completes when the last outstanding lease drains.
+            if (rit->second.lifecycle == RegistrationLifecycle::REVOKING &&
+                rit->second.lease_count == 0) {
+                rit->second.lifecycle = RegistrationLifecycle::REVOKED;
+                acct_.revocations.increment();
+            }
         }
         acct_.active_leases.decrement();
         return true;
@@ -546,10 +631,29 @@ public:
             return decision(AccessOutcome::REJECT_STALE_REGISTRATION,
                                  "registration freshness is " + std::string(freshness_name(rec.freshness)));
         }
+        if (rec.lifecycle != RegistrationLifecycle::ACTIVE &&
+            rec.lifecycle != RegistrationLifecycle::REGISTERED) {
+            return decision(AccessOutcome::REJECT_NOT_REGISTERED,
+                                 "registration lifecycle " + std::string(lifecycle_name(rec.lifecycle)) +
+                                 " does not permit remote access");
+        }
 
         // Authority.
         AccessDecision ad = validate_authority(authority_, request.authority);
-        if (ad.outcome != AccessOutcome::ALLOW) return ad;
+        if (ad.outcome != AccessOutcome::ALLOW) return decision(ad.outcome, ad.explanation);
+
+        // The registration and its keys are bound to the incarnation that
+        // issued them: a current envelope never revives authority issued under
+        // an earlier CoordinatorEpoch or WorkerBootId.
+        if (rec.epoch != authority_.coordinator_epoch) {
+            return decision(AccessOutcome::REJECT_STALE_EPOCH,
+                                 "registration was issued under CoordinatorEpoch " + int_to_str(rec.epoch.value()) +
+                                 "; current is " + int_to_str(authority_.coordinator_epoch.value()));
+        }
+        if (rec.boot != authority_.worker_boot) {
+            return decision(AccessOutcome::REJECT_STALE_BOOT,
+                                 "registration was issued under a superseded WorkerBootId");
+        }
 
         // Generation currentness.
         if (request.expected_registration_generation.is_valid() &&
@@ -578,6 +682,7 @@ public:
         if (request.backend.is_valid() && request.backend != rec.backend) {
             return decision(AccessOutcome::REJECT_BACKEND, "backend mismatch");
         }
+        std::lock_guard<std::mutex> bg(backend_mutex_);
         auto bit = backends_.find(rec.backend);
         if (bit == backends_.end() || bit->second->generation() != rec.backend_generation) {
             return decision(AccessOutcome::REJECT_BACKEND, "backend generation changed");
@@ -678,6 +783,7 @@ public:
                     acct_.active_leases.decrement();
                 }
             }
+            rec.lease_count = 0; // no lease on this registration is active any more.
             // Free the buffer's single-flight registration slot so a fresh
             // registration can proceed under new authority.
             active_registration_for_buffer_.erase(rec.buffer_id);
@@ -716,6 +822,7 @@ public:
         rec.remote_key.opaque_value = rec.remote_key.opaque_value ^ 0x0101010101010101ull;
         // Propagate to the backend so its authority token matches the runtime.
         if (auto b = backend_locked(rec.backend); b && !rec.backend_handle.empty()) {
+            std::lock_guard<std::mutex> bg(backend_mutex_);
             std::string bex;
             b->rotate_key(RegisterHandle{rec.memory_region_id, rec.backend_handle},
                           rec.remote_key.key_generation, bex);
@@ -728,7 +835,7 @@ public:
         // Prepare outside-lock state.
         std::string handle;
         MemoryRegionId region;
-        BackendId backend;
+        std::shared_ptr<IBackend> b;
         {
             std::lock_guard<std::mutex> g(mutex_);
             auto rit = registrations_.find(registration);
@@ -752,20 +859,24 @@ public:
             rec.lifecycle = RegistrationLifecycle::DEREGISTERING;
             handle = rec.backend_handle;
             region = rec.memory_region_id;
-            backend = rec.backend;
+            b = backend_locked(rec.backend);
         }
-        // Backend deregister outside the lock.
-        if (backend.is_valid()) {
-            auto b = backend_locked(backend);
-            if (b) {
-                RegisterOutcome bo = b->deregister_buffer(RegisterHandle{region, handle});
-                if (!bo.ok) {
-                    std::lock_guard<std::mutex> g(mutex_);
-                    auto rit = registrations_.find(registration);
-                    if (rit != registrations_.end()) rit->second.lifecycle = RegistrationLifecycle::FAILED;
-                    explanation = "backend deregister failed: " + bo.message;
-                    return false;
-                }
+        // Backend deregister outside the lock. A registration without a live
+        // backend handle (recovered state) holds nothing at the backend, and a
+        // backend that no longer knows the handle (backend restart) has nothing
+        // left to release; neither blocks the logical deregistration.
+        if (b && !handle.empty()) {
+            RegisterOutcome bo;
+            {
+                std::lock_guard<std::mutex> bg(backend_mutex_);
+                bo = b->deregister_buffer(RegisterHandle{region, handle});
+            }
+            if (!bo.ok && bo.code != "NOT_FOUND") {
+                std::lock_guard<std::mutex> g(mutex_);
+                auto rit = registrations_.find(registration);
+                if (rit != registrations_.end()) rit->second.lifecycle = RegistrationLifecycle::FAILED;
+                explanation = "backend deregister failed: " + bo.message;
+                return false;
             }
         }
         std::lock_guard<std::mutex> g(mutex_);
@@ -818,6 +929,7 @@ public:
 
     // -- accounting helpers ------------------------------------------
     void account_registration_commit(RegistrationRecord& rec) {
+        if (!accounted_.insert(rec.id).second) return; // already counted.
         acct_.active_registrations.increment();
         acct_.registered_bytes.increment(rec.length);
         if (rec.domain == MemoryDomain::HOST_PINNED) acct_.pinned_bytes.increment(rec.length);
@@ -826,6 +938,7 @@ public:
     }
 
     void account_registration_invalidate(RegistrationRecord& rec) {
+        if (accounted_.erase(rec.id) == 0) return; // never counted, or already released.
         acct_.active_registrations.decrement();
         acct_.registered_bytes.decrement(rec.length);
         if (rec.domain == MemoryDomain::HOST_PINNED) acct_.pinned_bytes.decrement(rec.length);
@@ -852,6 +965,8 @@ public:
             for (auto& [id, be] : buffers_) { (void)id; state.buffers.push_back(be.descriptor); }
             for (auto& [id, rec] : registrations_) {
                 (void)id;
+                // An in-flight reservation is not yet a registration.
+                if (rec.lifecycle == RegistrationLifecycle::REGISTERING) continue;
                 RegistrationRecord logical = rec;
                 logical.backend_handle.clear();
                 logical.memory_region_id = MemoryRegionId{};
@@ -861,14 +976,37 @@ public:
                 logical.freshness = Freshness::REVALIDATION_REQUIRED;
                 state.registrations.push_back(logical);
             }
-            for (auto& [id, de] : domains_) { (void)id; (void)de; state.domains.push_back(ProtectionDomainId(id.value())); }
-            for (auto& [id, rec] : registrations_) { state.remote_key_history.push_back(rec.remote_key); }
-            for (auto& [id, rec] : registrations_) { state.local_key_history.push_back(rec.local_key); }
+            for (auto& [id, de] : domains_) {
+                // A destroyed domain must not come back as a live one.
+                if (de.state == DomainState::DESTROYED) continue;
+                state.domains.push_back(ProtectionDomainId(id.value()));
+            }
             for (auto& [id, rec] : registrations_) {
+                if (rec.lifecycle == RegistrationLifecycle::REGISTERING) continue;
+                state.remote_key_history.push_back(rec.remote_key);
+            }
+            for (auto& [id, rec] : registrations_) {
+                if (rec.lifecycle == RegistrationLifecycle::REGISTERING) continue;
+                state.local_key_history.push_back(rec.local_key);
+            }
+            // Deterministic encoding: order every collection by identity, not
+            // by hash-map iteration order.
+            std::sort(state.buffers.begin(), state.buffers.end(),
+                      [](const BufferDescriptor& a, const BufferDescriptor& b) { return a.id < b.id; });
+            std::sort(state.registrations.begin(), state.registrations.end(),
+                      [](const RegistrationRecord& a, const RegistrationRecord& b) { return a.id < b.id; });
+            std::sort(state.domains.begin(), state.domains.end());
+            std::sort(state.remote_key_history.begin(), state.remote_key_history.end(),
+                      [](const RemoteKey& a, const RemoteKey& b) { return a.registration < b.registration; });
+            std::sort(state.local_key_history.begin(), state.local_key_history.end(),
+                      [](const LocalKey& a, const LocalKey& b) { return a.registration < b.registration; });
+            for (const RegistrationRecord& rec : state.registrations) {
                 if (!rec.invalidation_reason.empty()) state.revocation_history.push_back(rec.invalidation_reason);
             }
             state.accounting_summary = acct_;
             state.backend_capability_snapshot = backend_summaries_unlocked();
+            std::sort(state.backend_capability_snapshot.begin(), state.backend_capability_snapshot.end(),
+                      [](const BackendInfo& a, const BackendInfo& b) { return a.id < b.id; });
             state.authority_snapshot = authority_;
             state.policy_generation = authority_.policy_generation;
         }
@@ -894,6 +1032,7 @@ public:
     }
 
     std::vector<BackendInfo> backend_summaries_unlocked() {
+        std::lock_guard<std::mutex> bg(backend_mutex_);
         std::vector<BackendInfo> out;
         for (auto& [id, b] : backends_) {
             BackendInfo info;
@@ -916,6 +1055,10 @@ public:
         if (!rdmabuffer::persistence::parse(bytes, state, err)) return false;
 
         std::lock_guard<std::mutex> g(mutex_);
+        // Identities named by the recovered state are never issued again.
+        const auto retire_id = [](std::uint64_t& next, std::uint64_t used) {
+            if (used >= next && used != UINT64_MAX) next = used + 1;
+        };
         for (const BufferDescriptor& b : state.buffers) {
             BufferEntry be; be.descriptor = b; be.registered = false;
             if (buffers_.count(b.id) == 0) {
@@ -926,6 +1069,7 @@ public:
             }
         }
         for (const ProtectionDomainId& d : state.domains) {
+            retire_id(next_domain_, d.value());
             if (domains_.count(d) == 0) {
                 DomainEntry de; de.state = DomainState::ACTIVE; de.generation = ProtectionDomainGeneration(1);
                 domains_[d] = std::move(de);
@@ -935,9 +1079,11 @@ public:
         }
         // Recovered registrations are NOT automatically live.
         for (const RegistrationRecord& rec : state.registrations) {
-            if (registrations_.count(rec.id) != 0) { /* duplicate identity -> skip */ }
-            if (rec.lease_count != 0) { /* logical */ }
+            retire_id(next_registration_, rec.id.value());
+            retire_id(next_domain_, rec.domain_id.value());
+            if (registrations_.count(rec.id) != 0) continue; // duplicate identity -> skip
             RegistrationRecord r = rec;
+            r.lease_count = 0; // leases are not recovered; none is live.
             r.lifecycle = RegistrationLifecycle::REVALIDATION_REQUIRED;
             r.freshness = Freshness::REVALIDATION_REQUIRED;
             r.remote_key.revoked = true;
@@ -948,7 +1094,9 @@ public:
             registrations_[r.id] = std::move(r);
             ++report.recovered_registrations;
         }
-        authority_ = state.authority_snapshot;
+        // Persisted authority never replaces the live authority of this
+        // incarnation; it is adopted only when none has been set.
+        if (!authority_.coordinator_epoch.is_valid()) authority_ = state.authority_snapshot;
         report.persistence_ok = true;
         report.semantic_digest = rdmabuffer::persistence::semantic_digest(state);
         // Never auto-ACCOUNT recovered live registrations: nothing is live.

@@ -294,7 +294,16 @@ void SyntheticBackend::rollover_transport_generation() noexcept {
     }
 }
 
-void SyntheticBackend::rollover_nic_generation() noexcept { nic_gen_ = nic_gen_.next(); }
+void SyntheticBackend::rollover_nic_generation() noexcept {
+    nic_gen_ = nic_gen_.next();
+    // A NIC generation change invalidates live key material, like a transport
+    // rollover: keys issued under the previous NIC generation are stale.
+    for (auto& [k, e] : entries_) {
+        (void)k;
+        e.revalidate_required = true;
+        e.key_generation = e.key_generation.next();
+    }
+}
 
 void SyntheticBackend::simulate_backend_restart() {
     // A fresh backend incarnation starts with no live handles. All previously
